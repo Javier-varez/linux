@@ -15,6 +15,7 @@
 #include <linux/interrupt.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_altmode.h>
+#include <linux/usb/pd_vdo.h>
 #include <linux/usb/role.h>
 
 #include "tps6598x.h"
@@ -37,7 +38,10 @@
 #define TPS_REG_CTRL_CONF		0x29
 #define TPS_REG_POWER_STATUS		0x3f
 #define TPS_REG_RX_IDENTITY_SOP		0x48
+#define CD321X_VDM_STATUS_REG		0x4d
 #define TPS_REG_DATA_STATUS		0x5f
+
+#define MAX_VDM_LEN			7
 
 /* TPS_REG_SYSTEM_CONF bits */
 #define TPS_SYSCONF_PORTINFO(c)		((c) & 7)
@@ -50,6 +54,13 @@ enum {
 	TPS_PORTINFO_DRP_DFP,
 	TPS_PORTINFO_DRP_DFP_DRD,
 	TPS_PORTINFO_SOURCE,
+};
+
+enum tps_vdm_sop_target {
+	TPS_VDM_SOP_TARGET_SOP,
+	TPS_VDM_SOP_TARGET_SOP_PRIME,
+	TPS_VDM_SOP_TARGET_SOP_PRIME_PRIME,
+	TPS_VDM_SOP_TARGET_SOP_DEBUG,
 };
 
 /* TPS_REG_RX_IDENTITY_SOP */
@@ -115,6 +126,29 @@ static const char *tps6598x_psy_name_prefix = "tps6598x-source-psy-";
  * https://www.ti.com/lit/ug/slvuan1a/slvuan1a.pdf
  */
 #define TPS_MAX_LEN	64
+
+static int
+tps6598x_block_read_max(struct tps6598x *tps, u8 reg, void *val, size_t len, size_t* read_len)
+{
+	u8 data[TPS_MAX_LEN + 1];
+	int ret;
+
+	if (len + 1 > sizeof(data))
+		return -EINVAL;
+
+	if (!tps->i2c_protocol)
+		return regmap_raw_read(tps->regmap, reg, val, len);
+
+	ret = regmap_raw_read(tps->regmap, reg, data, len + 1);
+	if (ret) {
+		dev_err(tps->dev, "regmap_raw_read returned %d\n", ret);
+		return ret;
+	}
+
+	*read_len = data[0];
+	memcpy(val, &data[1], len);
+	return 0;
+}
 
 static int
 tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len)
@@ -293,7 +327,7 @@ static void tps6598x_disconnect(struct tps6598x *tps, u32 status)
 }
 
 static int tps6598x_exec_cmd(struct tps6598x *tps, const char *cmd,
-			     size_t in_len, u8 *in_data,
+			     size_t in_len, const u8 *in_data,
 			     size_t out_len, u8 *out_data)
 {
 	unsigned long timeout;
@@ -595,6 +629,53 @@ static int tps6598x_check_mode(struct tps6598x *tps)
 	return -ENODEV;
 }
 
+static int cd321x_set_dbma_mode(struct tps6598x *tps, const bool enable)
+{
+	const char byte = enable ? '\x01' : '\x00';
+	return tps6598x_exec_cmd(tps, "DBMa", 1, &byte, 0, NULL);
+}
+
+static int cd321x_unlock(struct tps6598x *tps)
+{
+	const char prefix[]= "apple,";
+	char code[sizeof(u32)] = {};
+	struct device_node* node = NULL;
+	const char* compatible = NULL;
+	int ret = 0;
+
+	node = of_find_node_by_path("/");
+	if (node == NULL) {
+		dev_err(tps->dev, "Could not find root node");
+		return -ENODEV;
+	}
+
+	ret = of_property_read_string(node, "compatible", &compatible);
+	if (ret || (compatible == NULL)) {
+		dev_err(tps->dev, "Could not find compatible prop");
+		of_node_put(node);
+		return -EINVAL;
+	}
+	of_node_put(node);
+
+	// Validate the compatible
+	if (strncmp(prefix, compatible, sizeof(prefix) - 1)) {
+		dev_err(tps->dev, "Not an apple machine, ignoring");
+		return -EINVAL;
+	}
+	compatible += sizeof(prefix) - 1;
+
+	for (int i = 0; i < sizeof(u32); i++) {
+		const char c = compatible[sizeof(u32) - 1 - i];
+		if ((c >= 'a') && (c <= 'z'))
+			code[i] = c + 'A' - 'a';
+		else
+			code[i] = c;
+	}
+
+	return tps6598x_exec_cmd(tps, "LOCK", sizeof(u32), (const uint8_t*)&code, 0, NULL);
+}
+
+
 static const struct regmap_config tps6598x_regmap_config = {
 	.reg_bits = 8,
 	.val_bits = 8,
@@ -692,6 +773,103 @@ static int devm_tps6598_psy_register(struct tps6598x *tps)
 					       &psy_cfg);
 	return PTR_ERR_OR_ZERO(tps->psy);
 }
+
+static int tps6598x_send_vdm(struct tps6598x* const tps,
+			     const enum tps_vdm_sop_target sop_target,
+			     u32* const data, const size_t size) {
+	u8 status_data[64];
+	size_t r_status_data_size = 0;
+	unsigned long timeout;
+	int ret = 0;
+	u8 vdm_data[1 + MAX_VDM_LEN * sizeof(u32)] = {
+		FIELD_PREP(TPS_VDM_TASK_HEADER_SOP_TARGET, sop_target) | size,
+	};
+	u8 rxst = 0;
+
+	if (size > MAX_VDM_LEN) {
+		return -EINVAL;
+	}
+	memcpy(&vdm_data[1], data, size * sizeof(u32));
+
+	ret = tps6598x_block_read_max(tps, CD321X_VDM_STATUS_REG,
+			       status_data, 64, &r_status_data_size);
+	if (ret)
+		return ret;
+	rxst = status_data[0];
+
+	ret = tps6598x_exec_cmd(tps, "VDMs", sizeof(vdm_data), vdm_data, 0, NULL);
+	if (ret)
+		return ret;
+
+	timeout = jiffies + msecs_to_jiffies(1000);
+	do {
+		ret = tps6598x_block_read_max(tps, CD321X_VDM_STATUS_REG,
+				status_data, 64, &r_status_data_size);
+		if (ret)
+			return ret;
+
+		if (time_is_before_jiffies(timeout))
+			return -ETIMEDOUT;
+	} while (rxst == status_data[0]);
+
+	dev_info(tps->dev, "vdm status %d", rxst);
+	return ret;
+}
+
+static ssize_t handle_send_vdm_write(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t count)
+{
+	struct i2c_client* client = container_of(dev, struct i2c_client, dev);
+	struct tps6598x *tps = i2c_get_clientdata(client);
+	int ret = 0;
+	char mode[5] = { };
+	u32 reset_vdm[] = {
+		VDO(0x05ac, 1, 0, 0x12),
+		0x00000105,
+		0x80000000,
+	};
+
+	mutex_lock(&tps->lock);
+
+	ret = cd321x_unlock(tps);
+	if (ret) {
+		dev_err(dev, "Unable to unlock tps %d", ret);
+		goto out_unlock_mutex;
+	}
+
+	ret = cd321x_set_dbma_mode(tps, 1);
+	if (ret) {
+		dev_err(dev, "Unable to set dbma mode %d", ret);
+		goto out_unlock_mutex;
+	}
+
+	ret = tps6598x_read32(tps, TPS_REG_MODE, (void *)mode);
+	if (ret) {
+		dev_err(dev, "Error reading TPS_REG_MODE!");
+		goto out_reset_mode;
+	} else if (strncmp(mode, "DBMa", 4) != 0) {
+		dev_err(dev, "Unable to set DBMa mode: %s", mode);
+		goto out_reset_mode;
+	}
+
+	ret = tps6598x_send_vdm(tps, TPS_VDM_SOP_TARGET_SOP_DEBUG,
+			 reset_vdm, ARRAY_SIZE(reset_vdm));
+	if (ret) {
+		dev_err(dev, "Error sending vdm command: %d", ret);
+		goto out_reset_mode;
+	}
+
+out_reset_mode:
+	if (cd321x_set_dbma_mode(tps, 0))
+		dev_err(dev, "Error resetting mode");
+out_unlock_mutex:
+	mutex_unlock(&tps->lock);
+	if (ret)
+		return ret;
+	return count;
+}
+
+DEVICE_ATTR(send_vdm, S_IWUSR, NULL, handle_send_vdm_write);
 
 static int tps6598x_probe(struct i2c_client *client)
 {
@@ -848,6 +1026,12 @@ static int tps6598x_probe(struct i2c_client *client)
 	i2c_set_clientdata(client, tps);
 	fwnode_handle_put(fwnode);
 
+	ret = device_create_file(&client->dev, &dev_attr_send_vdm);
+	if (ret) {
+		dev_err(&client->dev, "Error creating the VDM attribute file");
+		return -ENOMEM;
+	}
+
 	return 0;
 
 err_disconnect:
@@ -866,6 +1050,8 @@ err_clear_mask:
 static void tps6598x_remove(struct i2c_client *client)
 {
 	struct tps6598x *tps = i2c_get_clientdata(client);
+
+	device_remove_file(&client->dev, &dev_attr_send_vdm);
 
 	tps6598x_disconnect(tps, 0);
 	typec_unregister_port(tps->port);
